@@ -83,6 +83,16 @@ final class SettingsStore: ObservableObject {
         (365, "1 year"),
         (0, "Never"),
     ]
+    static let maxImageSizeOptions: [(bytes: Int, label: String)] = [
+        (5_000_000, "5 MB"),
+        (25_000_000, "25 MB"),
+        (100_000_000, "100 MB"),
+    ]
+    static let maxFileSizeOptions: [(bytes: Int, label: String)] = [
+        (10_000_000, "10 MB"),
+        (50_000_000, "50 MB"),
+        (200_000_000, "200 MB"),
+    ]
 
     private enum Keys {
         static let monitoringEnabled = "monitoringEnabled"
@@ -91,6 +101,10 @@ final class SettingsStore: ObservableObject {
         static let retentionDays = "retentionDays"
         static let excludedBundleIDs = "excludedBundleIDs"
         static let skipPasswordLikeText = "skipPasswordLikeText"
+        static let captureImages = "captureImages"
+        static let captureFiles = "captureFiles"
+        static let maxImageSizeBytes = "maxImageSizeBytes"
+        static let maxFileSizeBytes = "maxFileSizeBytes"
         static let placement = "panelPlacement"
         static let firstRunCompleted = "firstRunCompleted"
     }
@@ -115,6 +129,18 @@ final class SettingsStore: ObservableObject {
     @Published var skipPasswordLikeText: Bool {
         didSet { defaults.set(skipPasswordLikeText, forKey: Keys.skipPasswordLikeText) }
     }
+    @Published var captureImages: Bool {
+        didSet { defaults.set(captureImages, forKey: Keys.captureImages) }
+    }
+    @Published var captureFiles: Bool {
+        didSet { defaults.set(captureFiles, forKey: Keys.captureFiles) }
+    }
+    @Published var maxImageSizeBytes: Int {
+        didSet { defaults.set(maxImageSizeBytes, forKey: Keys.maxImageSizeBytes) }
+    }
+    @Published var maxFileSizeBytes: Int {
+        didSet { defaults.set(maxFileSizeBytes, forKey: Keys.maxFileSizeBytes) }
+    }
     @Published var placement: PanelPlacement {
         didSet { defaults.set(placement.rawValue, forKey: Keys.placement) }
     }
@@ -131,6 +157,10 @@ final class SettingsStore: ObservableObject {
             Keys.retentionDays: 30,
             Keys.excludedBundleIDs: Self.defaultExcludedBundleIDs,
             Keys.skipPasswordLikeText: true,
+            Keys.captureImages: true,
+            Keys.captureFiles: true,
+            Keys.maxImageSizeBytes: 25_000_000,
+            Keys.maxFileSizeBytes: 50_000_000,
             Keys.placement: PanelPlacement.auto.rawValue,
             Keys.firstRunCompleted: false,
         ])
@@ -140,6 +170,10 @@ final class SettingsStore: ObservableObject {
         retentionDays = defaults.integer(forKey: Keys.retentionDays)
         excludedBundleIDs = defaults.stringArray(forKey: Keys.excludedBundleIDs) ?? Self.defaultExcludedBundleIDs
         skipPasswordLikeText = defaults.bool(forKey: Keys.skipPasswordLikeText)
+        captureImages = defaults.bool(forKey: Keys.captureImages)
+        captureFiles = defaults.bool(forKey: Keys.captureFiles)
+        maxImageSizeBytes = defaults.integer(forKey: Keys.maxImageSizeBytes)
+        maxFileSizeBytes = defaults.integer(forKey: Keys.maxFileSizeBytes)
         placement = PanelPlacement(rawValue: defaults.string(forKey: Keys.placement) ?? "") ?? .auto
         firstRunCompleted = defaults.bool(forKey: Keys.firstRunCompleted)
     }

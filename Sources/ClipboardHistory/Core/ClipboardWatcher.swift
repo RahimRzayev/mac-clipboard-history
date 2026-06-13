@@ -36,10 +36,18 @@ final class ClipboardWatcher {
     var shouldIgnoreChangeCount: (Int) -> Bool = { _ in false }
     var excludedBundleIDs: () -> Set<String> = { [] }
     var maxItemSizeBytes: () -> Int = { 1_000_000 }
+    var maxImageSizeBytes: () -> Int = { 25_000_000 }
+    var maxFileSizeBytes: () -> Int = { 50_000_000 }
+    var captureImagesEnabled: () -> Bool = { true }
+    var captureFilesEnabled: () -> Bool = { true }
     /// Setting-gated heuristic net for password-manager browser extensions (spec §6.4):
     /// their copies carry no concealed marker and are attributed to the browser.
     var skipPasswordLikeText: () -> Bool = { true }
     var onCapture: (_ content: String, _ sourceApp: NSRunningApplication?) -> Void = { _, _ in }
+    /// A captured image: raw bytes + its UTI.
+    var onCaptureImage: (_ data: Data, _ uti: String, _ sourceApp: NSRunningApplication?) -> Void = { _, _, _ in }
+    /// Captured files: (display name, UTI, bytes) per file.
+    var onCaptureFiles: (_ files: [(name: String, uti: String, data: Data)], _ sourceApp: NSRunningApplication?) -> Void = { _, _ in }
     var onSecureInputStuckChanged: (Bool) -> Void = { _ in }
 
     init(secureInput: SecureInputMonitor, sourceTracker: SourceAppTracker) {
@@ -105,20 +113,90 @@ final class ClipboardWatcher {
             return
         }
 
-        // 6. Content read — only now, and only if a string type is actually present.
+        // 6. Content read, by kind priority FILE > IMAGE > TEXT. A Finder copy carries both
+        //    a file URL and its path string (the user copied the file, not the path); a
+        //    browser image copy carries the image plus alt-text. Cheap reads only on main;
+        //    heavy thumbnail/encrypt/payload work happens off-main in ClipboardStore.
+
+        // 6a. FILE — once this is a file copy we COMMIT to file-kind and return regardless of
+        //     whether the read succeeds. A rejected file (too big, unreadable, a directory)
+        //     must NOT fall through to the text branch, where the pasteboard's path string
+        //     would leak the file name into history.
+        if captureFilesEnabled(), types.contains(.fileURL) {
+            if let files = readFiles(maxTotalBytes: maxFileSizeBytes()), !files.isEmpty {
+                onCaptureFiles(files, sourceApp)
+            }
+            return
+        }
+
+        // 6b. IMAGE
+        if captureImagesEnabled(), let image = readImage(maxBytes: maxImageSizeBytes()) {
+            onCaptureImage(image.data, image.uti, sourceApp)
+            return
+        }
+
+        // 6c. TEXT (v1 path, byte-for-byte)
         guard types.contains(.string),
               let content = pasteboard.string(forType: .string) else { return }
         guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard content.utf8.count <= maxItemSizeBytes() else { return }
 
-        // 7. Password-shaped text (catches browser-extension copies the marker check
-        //    cannot see — e.g. Norton/1Password/Bitwarden extensions in Chrome/Safari).
+        // Password-shaped text (catches browser-extension copies the marker check cannot
+        // see — e.g. Norton/1Password/Bitwarden extensions in Chrome/Safari).
         if skipPasswordLikeText(), SensitiveTextDetector.looksLikePassword(content) {
             return
         }
 
-        // 8–9. Dedup + capture happen in ClipboardStore.
         onCapture(content, sourceApp)
+    }
+
+    /// Image UTIs we capture, in preference order (lossless first).
+    private static let imageTypes: [NSPasteboard.PasteboardType] = [
+        .png,
+        .tiff,
+        NSPasteboard.PasteboardType("public.jpeg"),
+        NSPasteboard.PasteboardType("public.heic"),
+    ]
+
+    /// Reads the best available image representation, rejecting over-cap data before any work.
+    private func readImage(maxBytes: Int) -> (data: Data, uti: String)? {
+        let available = pasteboard.types ?? []
+        for type in Self.imageTypes where available.contains(type) {
+            // `continue` (not return) so an over-cap/empty representation doesn't abort the
+            // scan — a smaller acceptable representation (e.g. TIFF when PNG is huge) can win.
+            guard let data = pasteboard.data(forType: type),
+                  !data.isEmpty, data.count <= maxBytes else { continue }
+            return (data, type.rawValue)
+        }
+        return nil
+    }
+
+    /// Reads regular files (not directories) copied to the pasteboard, with their bytes.
+    /// Returns nil if any read fails or the total exceeds the cap.
+    private func readFiles(maxTotalBytes: Int) -> [(name: String, uti: String, data: Data)]? {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        guard let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL],
+              !urls.isEmpty else { return nil }
+
+        var result: [(name: String, uti: String, data: Data)] = []
+        var total = 0
+        for url in urls {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                  !isDirectory.boolValue else {
+                return nil // directories/bundles deferred to a later version
+            }
+            // Reject by DECLARED size before reading, so we never load a multi-GB file into
+            // RAM just to discover it's over the cap.
+            let declared = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+            total += declared
+            guard total <= maxTotalBytes else { return nil }
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            let uti = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.identifier
+                ?? "public.data"
+            result.append((url.lastPathComponent, uti, data))
+        }
+        return result
     }
 
     static func containsSensitiveMarker(_ types: [NSPasteboard.PasteboardType]) -> Bool {

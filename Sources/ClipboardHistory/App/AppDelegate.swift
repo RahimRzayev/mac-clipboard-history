@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sourceTracker: SourceAppTracker!
     private var keyStore: KeychainKeyStore!
     private var encryption: EncryptionService!
+    private var payloadStore: PayloadStore?
     private var usingMemoryFallback = false
 
     private var settingsWindow: NSWindow?
@@ -38,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let storage = makeStorage()
         store = ClipboardStore(
             storage: storage,
+            payloadStore: payloadStore,
             maxItems: { [weak self] in self?.settings.maxItems ?? 500 },
             retentionDays: { [weak self] in self?.settings.retentionDays ?? 30 },
             rotateEncryptionKey: { [weak self] in
@@ -55,6 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         pasteController = PasteController(secureInput: secureInput)
+        // Wipe any file-paste temp bytes left over from a previous run (transient plaintext).
+        PasteController.cleanTempDirectory()
         setUpWatcher()
         setUpPanel()
         setUpMenuBar()
@@ -129,10 +133,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let supportDir = FileManager.default
                 .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent(bundleID, isDirectory: true)
-            return try SQLiteClipboardStorage(
+            let sqlite = try SQLiteClipboardStorage(
                 databaseURL: supportDir.appendingPathComponent("history.sqlite"),
                 encryption: encryption
             )
+            payloadStore = PayloadStore(
+                directory: supportDir.appendingPathComponent("payloads", isDirectory: true),
+                encryption: encryption
+            )
+            return sqlite
         } catch {
             // Degraded mode: app stays usable, history just won't persist (spec §3 fallback).
             encryption = EncryptionService(key: SymmetricKey(size: .bits256))
@@ -156,6 +165,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         watcher.maxItemSizeBytes = { [weak self] in
             self?.settings.maxItemSizeBytes ?? 1_000_000
         }
+        watcher.maxImageSizeBytes = { [weak self] in
+            self?.settings.maxImageSizeBytes ?? 25_000_000
+        }
+        watcher.maxFileSizeBytes = { [weak self] in
+            self?.settings.maxFileSizeBytes ?? 50_000_000
+        }
+        // Image/file capture needs a payload store; in memory-fallback mode it's off.
+        watcher.captureImagesEnabled = { [weak self] in
+            (self?.payloadStore != nil) && (self?.settings.captureImages ?? true)
+        }
+        watcher.captureFilesEnabled = { [weak self] in
+            (self?.payloadStore != nil) && (self?.settings.captureFiles ?? true)
+        }
         watcher.skipPasswordLikeText = { [weak self] in
             self?.settings.skipPasswordLikeText ?? true
         }
@@ -164,6 +186,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 content: content,
                 sourceBundleID: app?.bundleIdentifier,
                 sourceAppName: app?.localizedName
+            )
+        }
+        watcher.onCaptureImage = { [weak self] data, uti, app in
+            self?.store.capture(
+                image: data, uti: uti,
+                sourceBundleID: app?.bundleIdentifier, sourceAppName: app?.localizedName
+            )
+        }
+        watcher.onCaptureFiles = { [weak self] files, app in
+            self?.store.capture(
+                files: files,
+                sourceBundleID: app?.bundleIdentifier, sourceAppName: app?.localizedName
             )
         }
         watcher.onSecureInputStuckChanged = { [weak self] stuck in
@@ -246,6 +280,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func pasteItem(_ item: ClipboardItem) {
         let target = focusTracker.capturedApp
         panelController.hide()
+
+        // Resolve binary payloads BEFORE recording use, so a missing/undecodable payload
+        // neither bumps the use count nor pastes stale pasteboard contents.
+        var files: [(name: String, data: Data)]?
+        var imageData: Data?
+        switch item.kind {
+        case .text:
+            break
+        case .image:
+            guard let data = payload(of: item) else { return }
+            imageData = data
+        case .file:
+            guard let data = payload(of: item), let decoded = FilePayload.decode(data) else {
+                toast.show("This item's data is no longer available.")
+                return
+            }
+            files = decoded
+        }
+
         store.recordUse(of: item.id)
 
         // Permission is requested in context on first paste, never at launch (spec §11).
@@ -253,30 +306,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             AccessibilityPermission.requestPostEventAccess()
         }
 
-        pasteController.paste(item.content, into: target, focusTracker: focusTracker) { [weak self] outcome in
-            switch outcome {
-            case .pasted:
-                break
-            case .copiedOnly(let reason):
-                let message: String
-                switch reason {
-                case .noAccessibilityPermission:
-                    message = "Copied. Enable auto-paste in System Settings → Accessibility."
-                case .secureInputActive:
-                    message = "Copied. Auto-paste is unavailable while secure input is active — press ⌘V."
-                case .targetAppUnavailable:
-                    message = "Copied to clipboard — press ⌘V to paste."
-                }
-                self?.toast.show(message)
+        let onOutcome: (PasteOutcome) -> Void = { [weak self] outcome in
+            guard case .copiedOnly(let reason) = outcome else { return }
+            let message: String
+            switch reason {
+            case .noAccessibilityPermission:
+                message = "Copied. Enable auto-paste in System Settings → Accessibility."
+            case .secureInputActive:
+                message = "Copied. Auto-paste is unavailable while secure input is active — press ⌘V."
+            case .targetAppUnavailable:
+                message = "Copied to clipboard — press ⌘V to paste."
+            }
+            self?.toast.show(message)
+        }
+
+        switch item.kind {
+        case .text:
+            pasteController.paste(text: item.content, into: target, focusTracker: focusTracker, completion: onOutcome)
+        case .image:
+            pasteController.paste(image: imageData ?? Data(), uti: item.contentType,
+                                  into: target, focusTracker: focusTracker, completion: onOutcome)
+        case .file:
+            if !pasteController.paste(files: files ?? [], into: target,
+                                      focusTracker: focusTracker, completion: onOutcome) {
+                toast.show("This item's data is no longer available.")
             }
         }
     }
 
     private func copyItemOnly(_ item: ClipboardItem) {
         panelController.hide()
-        store.recordUse(of: item.id)
-        pasteController.copyToPasteboard(item.content)
-        toast.show("Copied to clipboard")
+        switch item.kind {
+        case .text:
+            store.recordUse(of: item.id)
+            pasteController.copyToPasteboard(item.content)
+            toast.show("Copied to clipboard")
+        case .image:
+            guard let data = payload(of: item) else { return }
+            store.recordUse(of: item.id)
+            pasteController.copyImageToPasteboard(data, uti: item.contentType)
+            toast.show("Copied to clipboard")
+        case .file:
+            guard let data = payload(of: item), let files = FilePayload.decode(data) else {
+                toast.show("This item's data is no longer available.")
+                return
+            }
+            store.recordUse(of: item.id)
+            if pasteController.copyFilesToPasteboard(files) {
+                toast.show("Copied to clipboard")
+            } else {
+                toast.show("This item's data is no longer available.")
+            }
+        }
+    }
+
+    /// Reads + decrypts a binary item's payload. Synchronous on the main actor — a paste is a
+    /// single user action and a one-shot AES-GCM decrypt is imperceptible, far simpler than
+    /// crossing the actor boundary (which would race key rotation). Toasts on a missing payload.
+    private func payload(of item: ClipboardItem) -> Data? {
+        guard let data = try? store.payloadData(for: item.id) else {
+            toast.show("This item's data is no longer available.")
+            return nil
+        }
+        return data
     }
 
     // MARK: - Menu actions

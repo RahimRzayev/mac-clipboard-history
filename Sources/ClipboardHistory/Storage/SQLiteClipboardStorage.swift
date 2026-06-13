@@ -81,6 +81,20 @@ final class SQLiteClipboardStorage: ClipboardStorage {
             try exec("CREATE INDEX IF NOT EXISTS idx_items_captured ON items(last_captured_at DESC)")
             try exec("PRAGMA user_version = 1")
         }
+        if version < 2 {
+            // v2: image/file history. All additive and nullable/defaulted, so every existing
+            // v1 row reads back as a valid text item. The version gate is the only guard
+            // (SQLite has no ADD COLUMN IF NOT EXISTS), so this block runs exactly once.
+            try exec("ALTER TABLE items ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'")
+            try exec("ALTER TABLE items ADD COLUMN image_pixel_w INTEGER")
+            try exec("ALTER TABLE items ADD COLUMN image_pixel_h INTEGER")
+            try exec("ALTER TABLE items ADD COLUMN thumb_enc BLOB")    // AES-GCM(JPEG thumbnail)
+            try exec("ALTER TABLE items ADD COLUMN manifest_enc BLOB") // AES-GCM(JSON [FileEntry])
+            // Binary dedup keys hash the bytes and can't be recomputed at fetch time, so they
+            // must be persisted (text recomputes its key from content and leaves this NULL).
+            try exec("ALTER TABLE items ADD COLUMN dedup_key TEXT")
+            try exec("PRAGMA user_version = 2")
+        }
     }
 
     // MARK: - ClipboardStorage
@@ -88,13 +102,19 @@ final class SQLiteClipboardStorage: ClipboardStorage {
     func insert(_ item: ClipboardItem) throws {
         let sql = """
             INSERT INTO items (id, created_at, last_captured_at, last_used_at, use_count, is_pinned,
-                               content_type, size_bytes, source_bundle_id, source_app_name, content_enc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               content_type, size_bytes, source_bundle_id, source_app_name, content_enc,
+                               kind, image_pixel_w, image_pixel_h, thumb_enc, manifest_enc, dedup_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
         let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
 
+        // Encrypt at the storage boundary from the in-memory PLAINTEXT — this is what lets
+        // Clear History re-encrypt under a rotated key by simply re-inserting items.
         let encrypted = try encryption.encrypt(item.content)
+        let thumbEnc = try item.thumbnail.map { try encryption.encryptData($0) }
+        let manifestEnc = try item.fileEntries.map { try encryption.encryptData(Self.encodeManifest($0)) }
+
         try bindText(statement, 1, item.id.uuidString)
         try check(sqlite3_bind_double(statement, 2, item.createdAt.timeIntervalSince1970))
         try check(sqlite3_bind_double(statement, 3, item.lastCapturedAt.timeIntervalSince1970))
@@ -102,13 +122,16 @@ final class SQLiteClipboardStorage: ClipboardStorage {
         try check(sqlite3_bind_int64(statement, 5, Int64(item.useCount)))
         try check(sqlite3_bind_int(statement, 6, item.isPinned ? 1 : 0))
         try bindText(statement, 7, item.contentType)
-        try check(sqlite3_bind_int64(statement, 8, Int64(item.sizeBytes)))
+        try check(sqlite3_bind_int64(statement, 8, item.sizeBytes))
         try bindOptionalText(statement, 9, item.sourceBundleID)
         try bindOptionalText(statement, 10, item.sourceAppName)
-        let blobStatus = encrypted.withUnsafeBytes { buffer in
-            sqlite3_bind_blob(statement, 11, buffer.baseAddress, Int32(buffer.count), SQLITE_TRANSIENT)
-        }
-        try check(blobStatus)
+        try bindBlob(statement, 11, encrypted)
+        try bindText(statement, 12, item.kind.rawValue)
+        try bindOptionalInt(statement, 13, item.imagePixelSize.map { Int64($0.width.rounded()) })
+        try bindOptionalInt(statement, 14, item.imagePixelSize.map { Int64($0.height.rounded()) })
+        try bindOptionalBlob(statement, 15, thumbEnc)
+        try bindOptionalBlob(statement, 16, manifestEnc)
+        try bindOptionalText(statement, 17, item.kind == .text ? nil : item.dedupKey)
         try step(statement)
     }
 
@@ -158,7 +181,7 @@ final class SQLiteClipboardStorage: ClipboardStorage {
     func fetchAll(limit: Int?) throws -> [ClipboardItem] {
         // Deterministic tie-breakers keep ordering stable across relaunches and match
         // MemoryClipboardStorage when lastCapturedAt collides (fixtures, imports).
-        var sql = "SELECT id, created_at, last_captured_at, last_used_at, use_count, is_pinned, content_type, source_bundle_id, source_app_name, content_enc FROM items ORDER BY last_captured_at DESC, created_at DESC, id"
+        var sql = "SELECT id, created_at, last_captured_at, last_used_at, use_count, is_pinned, content_type, source_bundle_id, source_app_name, content_enc, kind, image_pixel_w, image_pixel_h, thumb_enc, manifest_enc, dedup_key, size_bytes FROM items ORDER BY last_captured_at DESC, created_at DESC, id"
         if let limit {
             sql += " LIMIT \(limit)"
         }
@@ -179,18 +202,59 @@ final class SQLiteClipboardStorage: ClipboardStorage {
                 // not fatal — the rest of history stays usable.
                 continue
             }
-            let item = ClipboardItem(
-                id: id,
-                content: content,
-                contentType: columnText(statement, 6) ?? ClipboardItem.textContentType,
-                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
-                lastCapturedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
-                lastUsedAt: columnOptionalDate(statement, 3),
-                useCount: Int(sqlite3_column_int64(statement, 4)),
-                isPinned: sqlite3_column_int(statement, 5) != 0,
-                sourceBundleID: columnText(statement, 7),
-                sourceAppName: columnText(statement, 8)
-            )
+            let kind = ClipboardKind(rawValue: columnText(statement, 10) ?? "text") ?? .text
+            let contentType = columnText(statement, 6) ?? ClipboardItem.textContentType
+            let createdAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 1))
+            let lastCapturedAt = Date(timeIntervalSince1970: sqlite3_column_double(statement, 2))
+            let lastUsedAt = columnOptionalDate(statement, 3)
+            let useCount = Int(sqlite3_column_int64(statement, 4))
+            let isPinned = sqlite3_column_int(statement, 5) != 0
+            let sourceBundleID = columnText(statement, 7)
+            let sourceAppName = columnText(statement, 8)
+
+            let item: ClipboardItem
+            switch kind {
+            case .text:
+                item = ClipboardItem(
+                    id: id, content: content, contentType: contentType,
+                    createdAt: createdAt, lastCapturedAt: lastCapturedAt, lastUsedAt: lastUsedAt,
+                    useCount: useCount, isPinned: isPinned,
+                    sourceBundleID: sourceBundleID, sourceAppName: sourceAppName
+                )
+            case .image, .file:
+                // A binary row missing its persisted dedup key is unusable for dedup; skip it.
+                guard let dedupKey = columnText(statement, 15) else { continue }
+                // Distinguish a legitimately-absent blob (NULL column) from one that is
+                // PRESENT but fails to decrypt/decode — the latter is corruption, so skip the
+                // row entirely (matching v1's "decrypt failure skips the row" invariant).
+                var thumbnail: Data?
+                if let blob = columnBlob(statement, 13) {
+                    guard let data = try? encryption.decryptData(blob) else { continue }
+                    thumbnail = data
+                }
+                var fileEntries: [FileEntry]?
+                if let blob = columnBlob(statement, 14) {
+                    guard let data = try? encryption.decryptData(blob),
+                          let entries = Self.decodeManifest(data) else { continue }
+                    fileEntries = entries
+                }
+                var pixelSize: CGSize?
+                if sqlite3_column_type(statement, 11) != SQLITE_NULL,
+                   sqlite3_column_type(statement, 12) != SQLITE_NULL {
+                    pixelSize = CGSize(
+                        width: Double(sqlite3_column_int64(statement, 11)),
+                        height: Double(sqlite3_column_int64(statement, 12))
+                    )
+                }
+                item = ClipboardItem(
+                    id: id, kind: kind, contentType: contentType,
+                    sizeBytes: sqlite3_column_int64(statement, 16), dedupKey: dedupKey,
+                    createdAt: createdAt, lastCapturedAt: lastCapturedAt, lastUsedAt: lastUsedAt,
+                    useCount: useCount, isPinned: isPinned,
+                    sourceBundleID: sourceBundleID, sourceAppName: sourceAppName,
+                    thumbnail: thumbnail, imagePixelSize: pixelSize, fileEntries: fileEntries
+                )
+            }
             items.append(item)
         }
         // An I/O error / corruption mid-scan must throw, not masquerade as end-of-results —
@@ -265,6 +329,37 @@ final class SQLiteClipboardStorage: ClipboardStorage {
         } else {
             try check(sqlite3_bind_null(statement, index))
         }
+    }
+
+    private func bindBlob(_ statement: OpaquePointer, _ index: Int32, _ data: Data) throws {
+        let status = data.withUnsafeBytes { buffer in
+            sqlite3_bind_blob(statement, index, buffer.baseAddress, Int32(buffer.count), SQLITE_TRANSIENT)
+        }
+        try check(status)
+    }
+
+    private func bindOptionalBlob(_ statement: OpaquePointer, _ index: Int32, _ data: Data?) throws {
+        if let data {
+            try bindBlob(statement, index, data)
+        } else {
+            try check(sqlite3_bind_null(statement, index))
+        }
+    }
+
+    private func bindOptionalInt(_ statement: OpaquePointer, _ index: Int32, _ value: Int64?) throws {
+        if let value {
+            try check(sqlite3_bind_int64(statement, index, value))
+        } else {
+            try check(sqlite3_bind_null(statement, index))
+        }
+    }
+
+    private static func encodeManifest(_ entries: [FileEntry]) throws -> Data {
+        try JSONEncoder().encode(entries)
+    }
+
+    private static func decodeManifest(_ data: Data) -> [FileEntry]? {
+        try? JSONDecoder().decode([FileEntry].self, from: data)
     }
 
     private func columnText(_ statement: OpaquePointer, _ index: Int32) -> String? {

@@ -79,14 +79,32 @@ private struct ClipboardSettingsTab: View {
                 }
             }
 
-            Picker("Maximum item size", selection: $settings.maxItemSizeBytes) {
+            Picker("Maximum text size", selection: $settings.maxItemSizeBytes) {
                 ForEach(SettingsStore.maxItemSizeOptions, id: \.bytes) { option in
                     Text(option.label).tag(option.bytes)
                 }
             }
 
+            Section("Images & files") {
+                Toggle("Save copied images", isOn: $settings.captureImages)
+                Picker("Maximum image size", selection: $settings.maxImageSizeBytes) {
+                    ForEach(SettingsStore.maxImageSizeOptions, id: \.bytes) { option in
+                        Text(option.label).tag(option.bytes)
+                    }
+                }
+                .disabled(!settings.captureImages)
+
+                Toggle("Save copied files", isOn: $settings.captureFiles)
+                Picker("Maximum file size", selection: $settings.maxFileSizeBytes) {
+                    ForEach(SettingsStore.maxFileSizeOptions, id: \.bytes) { option in
+                        Text(option.label).tag(option.bytes)
+                    }
+                }
+                .disabled(!settings.captureFiles)
+            }
+
             Section {
-                Text("Pinned items are never removed by the item limit.")
+                Text("Pinned items are never removed by the item limit. Images and files are stored encrypted on disk, the same as text.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
