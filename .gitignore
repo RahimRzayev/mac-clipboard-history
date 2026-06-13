@@ -1,0 +1,32 @@
+# ── Private planning / spec docs (intentionally NOT published) ──
+overview.md
+overview-v2.md
+
+# ── Build products ──
+.build/
+build/
+*.app
+
+# ── SwiftPM / Xcode user state ──
+.swiftpm/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# ── macOS cruft ──
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ── Local secrets / signing (never commit) ──
+# This project has no API keys, accounts, or tokens — but guard against future additions:
+*.p12
+*.cer
+*.provisionprofile
+*.entitlements.local
+.env
+.env.*
+secrets.*
