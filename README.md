@@ -118,3 +118,7 @@ stack paste. v3: optional E2E-encrypted sync, OCR.
   hotkey + recorder UI.
 * Pasteboard ignore-type conventions per [nspasteboard.org](http://nspasteboard.org), with
   patterns referenced from [Maccy](https://github.com/p0deje/Maccy) (MIT).
+
+## License
+
+[MIT](LICENSE) © 2026 Rahim Rzayev
